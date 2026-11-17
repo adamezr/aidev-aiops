@@ -1,0 +1,15 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install --quiet --upgrade boto3
+  build:
+    commands:
+      - python ai-review/review.py
+
+artifacts:
+  files:
+    - review-report.md

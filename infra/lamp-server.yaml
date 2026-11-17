@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AIDev-AIOps demo LAMP server. One Ubuntu EC2 instance running Apache, PHP and MariaDB.
+  This template contains two deliberate risks for the demo: SSH is open to the internet
+  and log rotation is disabled. The AI review is expected to flag both.
+
+Parameters:
+  KeyName:
+    Description: Existing EC2 key pair for SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t3.micro
+  UbuntuAmi:
+    Description: Latest Ubuntu 24.04 AMI, looked up from the public SSM parameter
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: aidev-aiops-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: aidev-aiops-public
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web server access
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: HTTP from anywhere
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        # DEMO RISK 1: SSH is open to the whole internet.
+        - Description: SSH from anywhere
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref UbuntuAmi
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: aidev-aiops-web
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y apache2 php libapache2-mod-php php-mysql mariadb-server
+          systemctl enable --now apache2 mariadb
+
+          # DEMO RISK 2: log rotation is turned off, so logs grow until the disk is full.
+          rm -f /etc/logrotate.d/rsyslog /etc/logrotate.d/apache2
+          systemctl disable --now logrotate.timer || true
+
+          rm -f /var/www/html/index.html
+          cat > /var/www/html/index.php <<'PHP'
+          <!DOCTYPE html>
+          <html>
+          <head><title>AIDev-AIOps Demo</title></head>
+          <body style="font-family: sans-serif; margin: 40px;">
+            <h1>AIDev-AIOps Demo Site</h1>
+            <p>Served by <?php echo gethostname(); ?></p>
+            <p>Disk used: <?php echo round(100 - disk_free_space('/') / disk_total_space('/') * 100); ?>%</p>
+          </body>
+          </html>
+          PHP
+          echo OK > /var/www/html/health
+
+Outputs:
+  WebsiteUrl:
+    Description: Demo site address
+    Value: !Sub "http://${WebServer.PublicDnsName}/"
+  InstanceId:
+    Description: Web server instance ID
+    Value: !Ref WebServer
+  SecurityGroupId:
+    Description: Web server security group
+    Value: !Ref WebServerSecurityGroup

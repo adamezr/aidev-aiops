@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AIDev-AIOps delivery pipeline. Source (GitHub) -> AI review (Claude on Amazon Bedrock)
+  -> manual approval -> deploy the LAMP server with CloudFormation.
+
+Parameters:
+  GitHubUsername:
+    Type: String
+    Default: adamezr
+  GitHubRepositoryName:
+    Type: String
+    Default: aidev-aiops
+  GitHubBranchName:
+    Type: String
+    Default: main
+  GitHubAccessToken:
+    Description: GitHub personal access token with repo scope
+    Type: String
+    NoEcho: true
+  MaintainerEmail:
+    Description: Receives the AI review and the approval request
+    Type: String
+  KeyName:
+    Description: Existing EC2 key pair for the LAMP server
+    Type: AWS::EC2::KeyPair::KeyName
+  ModelId:
+    Description: Bedrock model or inference profile used for the AI review
+    Type: String
+  LampStackName:
+    Description: Name of the stack the pipeline deploys
+    Type: String
+    Default: aidev-lamp
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 7
+
+  ReviewTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AIDev-AIOps review
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref MaintainerEmail
+
+  AIReviewRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AIReview
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: "*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ReviewTopic
+
+  AIReviewProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Description: AI coding agent review with Claude on Amazon Bedrock
+      ServiceRole: !GetAtt AIReviewRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ai-review/buildspec.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: MODEL_ID, Value: !Ref ModelId }
+          - { Name: REVIEW_TOPIC_ARN, Value: !Ref ReviewTopic }
+          - { Name: TEMPLATE_PATH, Value: infra/lamp-server.yaml }
+      TimeoutInMinutes: 10
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeployLampServer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:*
+                Resource: "*"
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}::parameter/aws/service/*"
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !GetAtt AIReviewProject.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ReviewTopic
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${LampStackName}/*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt DeployRole.Arn
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GetSource
+              Namespace: SourceVariables
+              ActionTypeId: { Category: Source, Owner: ThirdParty, Provider: GitHub, Version: "1" }
+              Configuration:
+                Owner: !Ref GitHubUsername
+                Repo: !Ref GitHubRepositoryName
+                Branch: !Ref GitHubBranchName
+                OAuthToken: !Ref GitHubAccessToken
+                PollForSourceChanges: true
+              OutputArtifacts: [{ Name: SourceCode }]
+
+        - Name: AIReview
+          Actions:
+            - Name: ClaudeReview
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref AIReviewProject
+              InputArtifacts: [{ Name: SourceCode }]
+              OutputArtifacts: [{ Name: ReviewReport }]
+
+        - Name: ManualReview
+          Actions:
+            - Name: ApproveChanges
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration:
+                NotificationArn: !Ref ReviewTopic
+                ExternalEntityLink: "#{SourceVariables.CommitUrl}"
+                CustomData: "Read the AI review email for commit #{SourceVariables.CommitId}, then approve or reject the deployment."
+
+        - Name: Deploy
+          Actions:
+            - Name: DeployLampServer
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: CloudFormation, Version: "1" }
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Ref LampStackName
+                TemplatePath: SourceCode::infra/lamp-server.yaml
+                RoleArn: !GetAtt DeployRole.Arn
+                ParameterOverrides: !Sub '{"KeyName": "${KeyName}"}'
+              InputArtifacts: [{ Name: SourceCode }]
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  AIReviewProjectName:
+    Value: !Ref AIReviewProject
+  LampStackName:
+    Value: !Ref LampStackName
